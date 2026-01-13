@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>VIBE RUNNER 3D</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Courier New', monospace; }
+        canvas { display: block; }
+        #start-screen {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.8); color: #00ffcc;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            z-index: 10; text-align: center;
+        }
+        h1 { font-size: 40px; text-shadow: 0 0 20px #00ffcc; margin-bottom: 10px; }
+        p { font-size: 14px; color: #fff; max-width: 300px; line-height: 1.5; }
+        #start-btn {
+            margin-top: 30px; padding: 15px 40px; background: #00ffcc; color: #000;
+            border: none; font-size: 20px; font-weight: bold; border-radius: 30px;
+            cursor: pointer; box-shadow: 0 0 30px #00ffcc; animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse { 0% {transform: scale(1);} 50% {transform: scale(1.05);} 100% {transform: scale(1);} }
+        #hud {
+            position: absolute; top: 10px; left: 10px; color: #00ffcc;
+            font-size: 16px; font-weight: bold; z-index: 5; pointer-events: none;
+            text-shadow: 0 0 5px #00ffcc;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="start-screen">
+        <h1>VIBE RUNNER</h1>
+        <p>⚠️ MICROPHONE REQUIRED ⚠️<br><br>Make noise to push the tunnel open. Silence = Death.</p>
+        <button id="start-btn">ACTIVATE MIC & START</button>
+    </div>
+
+    <div id="hud">SCORE: <span id="score">0</span></div>
+
+    <script type="module">
+        import * as THREE from 'https://cdn.skypack.dev/three@0.136.0';
+
+        // --- SETUP ---
+        const scene = new THREE.Scene();
+        // Fog to hide the distant end of the tunnel
+        scene.fog = new THREE.FogExp2(0x000000, 0.015);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        // Game State
+        let gameRunning = false;
+        let score = 0;
+        let speed = 0.5;
+        let cameraZ = 0;
+
+        // Audio State
+        let audioContext, analyser, dataArray, microphone;
+        let currentVolume = 0;
+
+        // --- THE PLAYER (Glowing Orb) ---
+        const playerGeometry = new THREE.SphereGeometry(0.5, 32, 32);
+        const playerMaterial = new THREE.MeshBasicMaterial({ color: 0x00ffcc });
+        const player = new THREE.Mesh(playerGeometry, playerMaterial);
+        scene.add(player);
+        
+        // Add a glow light to the player
+        const playerLight = new THREE.PointLight(0x00ffcc, 2, 10);
+        player.add(playerLight);
+
+        // Player Movement variables
+        let targetX = 0; let targetY = 0;
+        player.position.z = -5;
+
+        // --- THE TUNNEL (Particles) ---
+        // We create thousands of points arranged in a long cylinder
+        const tunnelLength = 200;
+        const particleCount = 5000;
+        const tunnelGeometry = new THREE.BufferGeometry();
+        const positions = [];
+        const initialRadii = []; // Store original distance from center
+
+        for (let i = 0; i < particleCount; i++) {
+            // Random angle and radius to form a tube
+            const angle = Math.random() * Math.PI * 2;
+            const radius = 5 + Math.random() * 2; // Base tunnel width
+            const x = Math.cos(angle) * radius;
+            const y = Math.sin(angle) * radius;
+            // Spread particles along Z axis
+            const z = (Math.random() - 0.5) * tunnelLength;
+            
+            positions.push(x, y, z);
+            initialRadii.push(radius);
+        }
+
+        tunnelGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+        
+        // The material for the dots
+        const tunnelMaterial = new THREE.PointsMaterial({
+            color: 0xff0055, // Red by default
+            size: 0.2,
+            transparent: true,
+            opacity: 0.8,
+            blending: THREE.AdditiveBlending
+        });
+
+        const tunnel = new THREE.Points(tunnelGeometry, tunnelMaterial);
+        scene.add(tunnel);
+
+        // --- CONTROLS (Mouse/Touch Drag) ---
+        document.addEventListener('mousemove', (e) => {
+            // Normalize mouse position to -1 to +1 range
+            targetX = (e.clientX / window.innerWidth) * 8 - 4;
+            targetY = -(e.clientY / window.innerHeight) * 8 + 4;
+        });
+        document.addEventListener('touchmove', (e) => {
+             e.preventDefault();
+             targetX = (e.touches[0].clientX / window.innerWidth) * 8 - 4;
+             targetY = -(e.touches[0].clientY / window.innerHeight) * 8 + 4;
+        }, { passive: false });
+
+
+        // --- AUDIO SETUP FUNCTION ---
+        async function startAudio() {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                // Ask for mic permission
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                microphone = audioContext.createMediaStreamSource(stream);
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 256; // Resolution of audio analysis
+                microphone.connect(analyser);
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+                startGame();
+            } catch (err) {
+                alert("Microphone access denied. Game cannot work without sound input.");
+            }
+        }
+
+        function startGame() {
+            document.getElementById('start-screen').style.display = 'none';
+            gameRunning = true;
+            animate();
+        }
+
+        document.getElementById('start-btn').addEventListener('click', startAudio);
+
+        // --- MAIN GAME LOOP ---
+        function animate() {
+            if (!gameRunning) return;
+            requestAnimationFrame(animate);
+
+            // 1. PROCESS AUDIO
+            analyser.getByteFrequencyData(dataArray);
+            // Calculate average volume (simple approach)
+            let sum = 0;
+            for(let i = 0; i < dataArray.length; i++) { sum += dataArray[i]; }
+            // Normalize volume (0.0 to 1.0ish)
+            currentVolume = sum / dataArray.length / 100; 
+            // Boost volume effect slightly
+            const expansionFactor = 1 + (currentVolume * 3);
+
+            // 2. ANIMATE TUNNEL BASED ON AUDIO
+            const posAttr = tunnel.geometry.attributes.position;
+            const count = posAttr.count;
+
+            for (let i = 0; i < count; i++) {
+                // Get original radius
+                const baseRadius = initialRadii[i];
+                // Get current X and Y
+                const x = posAttr.getX(i);
+                const y = posAttr.getY(i);
+                const z = posAttr.getZ(i);
+
+                // Calculate angle again to expand outward
+                const angle = Math.atan2(y, x);
+                // New radius is base radius * volume expansion
+                const newRadius = baseRadius * expansionFactor;
+
+                posAttr.setX(i, Math.cos(angle) * newRadius);
+                posAttr.setY(i, Math.sin(angle) * newRadius);
+
+                // Infinite tunnel illusion: If particle passes camera, cycle it to the back
+                if (z > cameraZ + 10) {
+                     posAttr.setZ(i, z - tunnelLength);
+                }
+            }
+            posAttr.needsUpdate = true; // Tell Three.js geometry changed
+
+            // Change tunnel color based on volume (Quiet=Red, Loud=Blue)
+            const hue = currentVolume > 0.2 ? 0.6 : 0.0; // Blue or Red
+            tunnelMaterial.color.setHSL(hue, 1.0, 0.5);
+
+
+            // 3. MOVE PLAYER & CAMERA
+            cameraZ -= speed;
+            camera.position.z = cameraZ;
+            
+            // Smooth player movement (Lerp)
+            player.position.x += (targetX - player.position.x) * 0.1;
+            player.position.y += (targetY - player.position.y) * 0.1;
+            player.position.z = cameraZ - 5; // Keep player in front of camera
+
+            // 4. GAME MECHANICS
+            score++;
+            document.getElementById('score').innerText = score;
+
+            // Simple Death Check: If volume is super low and player is far from center
+            // (A real game would check collision with the actual particle walls)
+            const distFromCenter = Math.sqrt(player.position.x*player.position.x + player.position.y*player.position.y);
+            // If tunnel is collapsed (volume low) and player isn't dead center
+            if(expansionFactor < 1.2 && distFromCenter > 2) {
+               // Game Over Condition (Just resets position for now for endless play)
+                // player.position.x = 0; player.position.y = 0;
+            }
+        }
+
+        // Handle Window Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+    </script>
+</body>
+</html>
+
